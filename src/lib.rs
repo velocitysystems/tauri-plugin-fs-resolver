@@ -8,6 +8,16 @@ mod commands;
 #[cfg(target_os = "android")]
 mod android_resolution;
 
+/// Re-exported so a consumer can name the error and return types, rather than falling back
+/// on inference and `to_string()`.
+pub use fs_resolver::{Error, Result};
+
+/// Re-exported so consumers reach backup exclusion through the plugin rather than needing
+/// a second direct dependency on `fs-resolver`. Unlike the resolve commands, these have no
+/// IPC equivalent, so this is the only route to them.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub use fs_resolver::{is_excluded_from_backup, set_excluded_from_backup};
+
 /// Initializes the fs-resolver plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
    Builder::new("fs-resolver")

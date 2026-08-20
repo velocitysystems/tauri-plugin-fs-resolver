@@ -49,6 +49,9 @@ Note: resolve_win32 still works under WinPackaged; only cross-platform mapping h
       hint: String,
    },
 
+   #[error("Backup exclusion failed for {path}: {reason}")]
+   BackupExclusionFailed { path: String, reason: String },
+
    #[error("Could not determine Windows packaging environment: {0}")]
    CouldNotDetermineWindowsPackagingEnvironment(String),
 

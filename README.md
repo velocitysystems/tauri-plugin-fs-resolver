@@ -38,8 +38,16 @@ This plugin also supports Windows unpackaged (`Win32Path`) and packaged
 package identity; `resolveMapping` / `resolve_mapping` picks which one to use
 from `FsEnvironment`.
 
+For data that must not be backed up, `set_excluded_from_backup` sets Apple's
+[`NSURLIsExcludedFromBackupKey`][apple-exclude-from-backup] on a path, keeping
+it out of iCloud Backup on iOS and Time Machine on macOS. Android expresses the
+same intent by location (`AndroidPath::NoBackupFilesDir`), and Linux and Windows
+have no equivalent, so it is compiled only for iOS and macOS. See [Apple backup
+exclusion](#apple-backup-exclusion).
+
 [dirs-rs]: https://github.com/dirs-dev/dirs-rs
 [tauri-12276]: https://github.com/tauri-apps/tauri/issues/12276
+[apple-exclude-from-backup]: https://developer.apple.com/documentation/foundation/nsurlisexcludedfrombackupkey
 
 | Platform | Supported |
 | -------- | --------- |
@@ -280,6 +288,10 @@ direct per-platform resolution (`resolve_ios`, `resolve_mac`, `resolve_linux`,
 with `PathResolver::new(bundle_identifier)?` (typically Tauri's
 `config().identifier`) and use that instance for all resolution.
 
+On iOS and macOS the crate also exposes `set_excluded_from_backup` and
+`is_excluded_from_backup` — free functions rather than methods because they need no
+resolver state. See [Apple backup exclusion](#apple-backup-exclusion).
+
 **TypeScript** exposes individual async functions (`resolveIosPath`,
 `resolveMacPath`, `resolveLinuxPath`, `resolveAndroidPath`, `resolveWin32Path`,
 `resolveWindowsApplicationDataPath`, `resolveAndroidPathCollection`,
@@ -289,13 +301,19 @@ resolution. On Windows, `resolveMapping()` uses `getFsEnvironment()` to choose
 between `win32` and `winPackaged`. Because Tauri IPC can only invoke flat
 commands (not methods on a Rust struct), the TypeScript layer does not mirror
 the `PathResolver` struct directly — the individual functions are the natural
-binding to the IPC surface.
+binding to the IPC surface. The backup-exclusion functions have no TypeScript
+equivalent: they mutate the file system rather than resolve a path, so they are
+deliberately not exposed over IPC.
 
 > **Platform gating:** Both layers check the current `FsEnvironment` before
 > making a resolve call. The TypeScript functions call `getFsEnvironment()`
 > before `invoke()` to avoid an unnecessary IPC round trip when running in the
 > wrong environment. The Rust side also validates the environment, so the check
 > is enforced regardless of how the command is invoked.
+>
+> The backup-exclusion functions are the one exception: they are gated on the
+> compile target, so an unsupported platform is a build error at the call site
+> rather than an `Err` at run time.
 
 #### CrossPlatformMapping
 
@@ -642,12 +660,84 @@ let temp_folder = resolver.resolve_windows_application_data(
 )?;
 ```
 
+#### Apple backup exclusion
+
+On Apple platforms, backup exclusion is a per-item attribute rather than a
+directory. On iOS, `Library/Caches` and `tmp` are the only locations excluded by
+default, and both are purgeable, so data that is expensive to rebuild but has no
+recovery value belongs in `Library/Application Support` with
+[`NSURLIsExcludedFromBackupKey`][apple-exclude-from-backup] set.
+
+These are Rust-only free functions, compiled for iOS and macOS only, so call
+sites on other platforms must be gated.
+
+**Rust**
+
+```rust
+use fs_resolver::PathResolver;
+
+let resolver = PathResolver::new("com.example.app".to_string())?;
+
+// `resolve_mac` rejects iOS and `resolve_ios` rejects macOS, so resolve per platform --
+// or use `resolve_mapping` with a `CrossPlatformMapping`.
+#[cfg(target_os = "macos")]
+let app_support = resolver.resolve_mac(&fs_resolver::MacPath::ApplicationSupportDirectoryForCurrentApp)?;
+
+#[cfg(target_os = "ios")]
+let app_support = resolver.resolve_ios(&fs_resolver::IosPath::ApplicationSupportDirectory)?;
+
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+{
+   // A dedicated subdirectory, not the app-support directory itself -- see below.
+   let generated = app_support.join("generated");
+   std::fs::create_dir_all(&generated)?;
+
+   // Idempotent, so this can run on every startup.
+   tauri_plugin_fs_resolver::set_excluded_from_backup(&generated, true)?;
+
+   // Confirm, or re-assert after a code path that may have recreated the directory.
+   assert!(tauri_plugin_fs_resolver::is_excluded_from_backup(&generated)?);
+}
+```
+
+The two functions have no IPC equivalent, so they are re-exported from the plugin along
+with `Error` and `Result`. `PathResolver` is not, so naming it still needs a direct
+`fs-resolver` dependency.
+
+Four easy mistakes:
+
+   * **Use a dedicated subdirectory**, not `Application Support/<bundle-id>` itself —
+     exclusion covers a directory's contents, settings included.
+   * **Purgeability follows from the location, not the flag.** Setting it on `Caches`
+     will not stop the OS purging that directory.
+   * **It is lost on delete-and-recreate**, since the attribute belongs to the item.
+     Reapply afterwards; `is_excluded_from_backup` reports whether it is still set.
+   * **`set_excluded_from_backup` needs an existing path.** It returns
+     `BackupExclusionFailed` for that, and for permission and read-only-volume
+     failures. Foundation's message can misattribute the cause — a permission denial
+     reports as a read-only volume — so the error also carries the domain, code, and
+     underlying error. A file system without extended attributes is not a failure:
+     macOS emulates them. `is_excluded_from_backup` needs no existing path: a missing
+     one reads as `false`, while one it cannot reach through its parent errors.
+
+Pass absolute paths resolved through `PathResolver`: relative paths resolve against
+the process working directory, `~` is not expanded, symlinks are followed, and
+nothing confines the path to your own app. Empty paths, interior NULs, and non-UTF-8
+paths return `InvalidPath`.
+
+Neither function is an IPC command. No registered command writes file contents or
+metadata — the Android resolvers do create their app-private directory, which is
+`Context`'s own behaviour — and `permissions/default.toml` grants every command to any
+capability naming `fs-resolver:default`, so an exposed setter would let the webview
+change backup behaviour on any path it named. A JavaScript binding needs a scoped
+permission first.
+
 ### Implementation
 
 | Platform | Resolution strategy                                              |
 |----------|------------------------------------------------------------------|
-| macOS    | Native calls via `objc2-foundation`                              |
-| iOS      | Native calls via `objc2-foundation`                              |
+| macOS    | Native calls via `objc2` and `objc2-foundation`                  |
+| iOS      | Native calls via `objc2` and `objc2-foundation`                  |
 | Linux    | Rust `std::env` and XDG conventions                              |
 | Windows  | `SHGetKnownFolderPath` (Win32) or WinRT `ApplicationData` (packaged) |
 | Android  | JNI bridge to Kotlin via Tauri `PluginHandle`                    |

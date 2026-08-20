@@ -835,6 +835,7 @@ name = "fs-resolver"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "objc2",
  "objc2-foundation",
  "serde",
  "test-case",
